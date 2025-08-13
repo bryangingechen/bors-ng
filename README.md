@@ -151,6 +151,30 @@ The batching strategy is O(E log N), where N is again the total number of pull r
 
 [original bors]: https://bors-ng.github.io/guide/2017/04/26/whirlwind/
 
+# How Bryan got it to run locally on an M4 macOS laptop in Aug 2025
+
+Run these lines from the `setup` script to build the project:
+
+```sh
+mix do clean, deps.get, ecto.drop, ecto.create, ecto.migrate, compile
+cd assets; npm install --force; cd ..
+```
+
+(Note that `npm` will complain and make some changes to `package-lock.json`. I haven't been committing those.)
+
+Start the postgres docker container from `CONTRIBUTING.md`:
+
+```sh
+docker run -it --rm --net=host -e POSTGRES_PASSWORD=Postgres1234 postgres:13
+```
+
+Start the server
+```sh
+mix phx.server
+```
+
+Now it should be live at <http://localhost:8000/>.
+
 # How to run it on your local machine
 
 If you're using a macOS or Linux command line with Docker on it,
