@@ -112,7 +112,7 @@ defmodule BorsNG.Application do
         },
         id: BorsNG.Endpoint
       },
-      {Phoenix.PubSub, [name: BorsNG.PubSub, adapter: Phoenix.PubSub.PG2]}
+      {Phoenix.PubSub, name: BorsNG.PubSub}
     ]
 
     # See http://elixir-lang.org/docs/stable/elixir/Supervisor.html
