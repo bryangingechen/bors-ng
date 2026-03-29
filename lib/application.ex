@@ -83,14 +83,14 @@ defmodule BorsNG.Application do
       %{
         type: :supervisor,
         id: BorsNG.Worker.Syncer.Registry,
-        start: {Registry, :start_link, [:unique, BorsNG.Worker.Syncer.Registry]}
+        start: {Registry, :start_link, [[keys: :unique, name: BorsNG.Worker.Syncer.Registry]]}
       },
       %{
         type: :supervisor,
         start: {
           Registry,
           :start_link,
-          [:unique, BorsNG.Worker.SyncerInstallation.Registry]
+          [[keys: :unique, name: BorsNG.Worker.SyncerInstallation.Registry]]
         },
         id: Installation
       },
