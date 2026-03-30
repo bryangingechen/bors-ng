@@ -76,6 +76,7 @@ defmodule BorsNg.Mixfile do
       {:ex_link_header, "~> 0.0.5"},
       {:oauth2, "~> 2.1"},
       {:joken, "~> 2.6"},
+      {:jose, "== 1.11.10", override: true},
       {:dialyxir, "~> 1.4", runtime: false, only: [:dev]},
       {:distillery,
        git: "https://github.com/bors-ng/distillery.git",

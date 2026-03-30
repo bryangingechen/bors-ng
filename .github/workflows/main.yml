@@ -100,8 +100,8 @@ jobs:
     - uses: actions/checkout@master
     - uses: erlef/setup-beam@v1
       with:
-        otp-version: "25.1"
-        elixir-version: "1.14.1"
+        otp-version: "26.2.5"
+        elixir-version: "1.16.3"
     - run: mix format --check-formatted
 
   ci-success:
