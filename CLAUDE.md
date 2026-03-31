@@ -117,19 +117,42 @@ CI matrix includes OTP 26, so we pin:
 {:jose, "== 1.11.10", override: true}
 ```
 
-### `phoenix_view` and the `formats:` compiler warning
+## Known compiler warnings
 
-The project uses the legacy `phoenix_view` package and `.eex` templates rather
-than the Phoenix 1.7 `Phoenix.Component` / HEEx pattern. This produces a
-compile-time warning:
+These warnings are present and intentionally left open pending larger migrations.
+
+### `formats:` — `phoenix_view` migration needed
 
 ```
 warning: use BorsNG.FooController must receive the :formats option
 ```
 
-This warning cannot be suppressed without migrating off `phoenix_view`, which
-is a larger task tracked separately. The app works correctly; the warning is
-cosmetic only.
+The project uses the legacy `phoenix_view` package and `.eex` templates rather
+than the Phoenix 1.7 `Phoenix.Component` / HEEx pattern. Fixing this requires
+migrating all controllers, views, and templates — a non-trivial task tracked
+separately.
+
+### `use Tesla.Builder` soft-deprecation
+
+```
+warning: `use Tesla.Builder` and `use Tesla` are soft-deprecated
+```
+
+Comes from the `oauth2` dependency pulling in Tesla's builder macro. Our own
+code (`lib/github/github/server.ex`) does not use `use Tesla` — it calls
+`Tesla.get!` etc. directly. The proper fix is migrating to Tesla's runtime
+configuration API, which affects `github/server.ex` and is tracked separately.
+
+### Charlist sigil in `toml` dep
+
+```
+warning: single-quoted strings represent charlists. Use ~c"" if you indeed want a charlist
+  deps/toml/lib/decoder.ex:264
+```
+
+Comes from the `toml` 0.7.0 dependency, which is the latest release and
+largely inactive upstream. Nothing to do here until a new toml release fixes
+it or we switch TOML parsers.
 
 
 ## Building
