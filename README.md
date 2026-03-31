@@ -202,7 +202,6 @@ And it'll run with the GitHub API mocked-out.
 To run tests, run:
 
     $ mix test
-    $ mix dogma
     $ mix dialyzer
 
 # How to set up your own real instance
