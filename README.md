@@ -327,7 +327,7 @@ Or you can do it manually:
 
     $ heroku create --buildpack "https://github.com/HashNuke/heroku-buildpack-elixir.git" bors-app
     $ heroku buildpacks:add https://github.com/gigalixir/gigalixir-buildpack-phoenix-static.git
-    $ heroku addons:create heroku-postgresql:hobby-dev
+    $ heroku addons:create heroku-postgresql:mini
     $ heroku config:set \
         MIX_ENV=prod \
         POOL_SIZE=18 \

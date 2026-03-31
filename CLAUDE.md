@@ -160,6 +160,18 @@ BORS_DATABASE=postgresql ELIXIR_ERL_OPTIONS="+fnu" mix test
 
 The `test` alias in `mix.exs` auto-runs `ecto.create` and `ecto.migrate`.
 
+## Upgrading Elixir / Erlang versions
+
+When bumping versions, update all of these files consistently:
+
+| File | What to change |
+|------|---------------|
+| `.tool-versions` | Local dev versions (asdf) |
+| `.github/workflows/main.yml` | `matrix.elixir`, `matrix.otp_release`, `exfmt` job |
+| `elixir_buildpack.config` | Heroku buildpack versions |
+| `phoenix_static_buildpack.config` | Node version (if needed) |
+| `CLAUDE.md` runtime requirements table | Documentation |
+
 ## CI
 
 The CI workflow is `.github/workflows/main.yml`. Key jobs:
