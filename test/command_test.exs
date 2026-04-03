@@ -12,6 +12,7 @@ defmodule BorsNG.CommandTest do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
 
     inst =
       %Installation{installation_xref: 91}
@@ -690,31 +691,12 @@ defmodule BorsNG.CommandTest do
            } = GitHub.ServerMock.get_state()
   end
 
-  test "retry work for members", %{proj: proj} do
-    pr = %BorsNG.GitHub.Pr{
-      number: 1,
-      title: "Test",
-      body: "Mess",
-      state: :open,
-      base_ref: "master",
-      head_sha: "00000001",
-      head_ref: "update",
-      base_repo_id: 13,
-      head_repo_id: 13,
-      user: %{
-        id: 2,
-        login: "pr_author"
-      }
-    }
-
+  test "retry does nothing useful after ping and posts nothing to retry message", %{proj: proj} do
     GitHub.ServerMock.put_state(%{
       {{:installation, 91}, 14} => %{
         branches: %{},
         comments: %{1 => []},
-        statuses: %{},
-        pulls: %{
-          1 => pr
-        }
+        statuses: %{}
       }
     })
 
@@ -738,29 +720,73 @@ defmodule BorsNG.CommandTest do
         project_id: proj.id
       })
 
-    c = %Command{
+    Command.run(%Command{
       project: proj,
       commenter: commenter,
       comment: "bors ping",
       patch: patch,
       pr_xref: 1
-    }
+    })
 
-    Command.run(c)
-
-    c = %Command{
+    Command.run(%Command{
       project: proj,
       commenter: commenter,
       comment: "bors retry",
       patch: patch,
       pr_xref: 1
-    }
-
-    Command.run(c)
+    })
 
     assert %{
              {{:installation, 91}, 14} => %{
-               comments: %{1 => ["pong", "pong"]}
+               comments: %{1 => ["Nothing to retry.", "pong"]}
+             }
+           } = GitHub.ServerMock.get_state()
+  end
+
+  test "retry does nothing after deactivate and posts nothing to retry message", %{proj: proj} do
+    GitHub.ServerMock.put_state(%{
+      {{:installation, 91}, 14} => %{
+        branches: %{},
+        comments: %{1 => []},
+        statuses: %{}
+      }
+    })
+
+    {:ok, commenter} =
+      Repo.insert(%BorsNG.Database.User{
+        user_xref: 1,
+        login: "commenter"
+      })
+
+    {:ok, patch} =
+      Repo.insert(%BorsNG.Database.Patch{
+        project_id: proj.id,
+        pr_xref: 1,
+        commit: "N",
+        into_branch: "master"
+      })
+
+    {:ok, _} =
+      Repo.insert(%BorsNG.Database.LinkMemberProject{
+        user_id: commenter.id,
+        project_id: proj.id
+      })
+
+    # Seed command history directly to avoid permission checks and worker GenServers
+    Logging.log_cmd(patch, commenter, :activate)
+    Logging.log_cmd(patch, commenter, :deactivate)
+
+    Command.run(%Command{
+      project: proj,
+      commenter: commenter,
+      comment: "bors retry",
+      patch: patch,
+      pr_xref: 1
+    })
+
+    assert %{
+             {{:installation, 91}, 14} => %{
+               comments: %{1 => ["Nothing to retry."]}
              }
            } = GitHub.ServerMock.get_state()
   end
@@ -790,7 +816,10 @@ defmodule BorsNG.CommandTest do
            } = GitHub.ServerMock.get_state()
   end
 
-  test "retry works with existing patch even if PR is unavailable from GitHub", %{proj: proj} do
+  test "retry posts nothing-to-retry when patch exists but no replayable history", %{proj: proj} do
+    # Verifies retry handles the case where the patch is in the DB (but the
+    # GitHub PR is unavailable) and there is no replayable prior command.
+    # This is distinct from the next test where no patch exists at all.
     GitHub.ServerMock.put_state(%{
       {{:installation, 91}, 14} => %{
         branches: %{},
@@ -822,14 +851,6 @@ defmodule BorsNG.CommandTest do
     Command.run(%Command{
       project: proj,
       commenter: commenter,
-      comment: "bors ping",
-      patch: patch,
-      pr_xref: 1
-    })
-
-    Command.run(%Command{
-      project: proj,
-      commenter: commenter,
       comment: "bors retry",
       patch: patch,
       pr_xref: 1
@@ -837,7 +858,7 @@ defmodule BorsNG.CommandTest do
 
     assert %{
              {{:installation, 91}, 14} => %{
-               comments: %{1 => ["pong", "pong"]}
+               comments: %{1 => ["Nothing to retry."]}
              }
            } = GitHub.ServerMock.get_state()
   end

@@ -591,8 +591,15 @@ defmodule BorsNG.Command do
   end
 
   def run(c, :retry) do
-    {commenter, cmd} = Logging.most_recent_cmd(c.patch)
-    run(%{c | commenter: commenter}, cmd)
+    case Logging.most_recent_cmd(c.patch) do
+      {commenter, cmd} ->
+        run(%{c | commenter: commenter}, cmd)
+
+      nil ->
+        c.project.repo_xref
+        |> Project.installation_connection(Repo)
+        |> GitHub.post_comment!(c.pr_xref, "Nothing to retry.")
+    end
   end
 
   def run(c, :bros) do
