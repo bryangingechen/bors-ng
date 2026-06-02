@@ -30,6 +30,13 @@ defmodule BorsNG.CommandTest do
     {:ok, inst: inst, proj: proj}
   end
 
+  # bors.toml fixture with a delegation default. Tests that exercise the
+  # no-`for=` path inject this into the ServerMock's `files` map so the
+  # delegate command can read the default from the PR's base branch.
+  defp delegation_toml(seconds \\ 24 * 60 * 60) do
+    ~s(status = ["ci"]\n[delegation]\ndefault_expiry_sec = #{seconds}\n)
+  end
+
   test "reject the empty string" do
     assert [] == Command.parse("")
     assert [] == Command.parse(nil)
@@ -287,6 +294,7 @@ defmodule BorsNG.CommandTest do
         branches: %{},
         comments: %{1 => ["bors #{delegate_command}"]},
         statuses: %{},
+        files: %{"master" => %{"bors.toml" => delegation_toml()}},
         pulls: %{
           1 => pr
         }
@@ -354,6 +362,7 @@ defmodule BorsNG.CommandTest do
         branches: %{},
         comments: %{1 => ["bors #{delegate_command}pr_author,reviewer"]},
         statuses: %{},
+        files: %{"master" => %{"bors.toml" => delegation_toml()}},
         pulls: %{
           1 => pr
         }
@@ -436,6 +445,7 @@ defmodule BorsNG.CommandTest do
           3 => ["bors #{undelegate_command}"]
         },
         statuses: %{},
+        files: %{"master" => %{"bors.toml" => delegation_toml()}},
         pulls: %{
           1 => pr
         }
@@ -538,6 +548,7 @@ defmodule BorsNG.CommandTest do
                            3 => ["bors #{undelegate_command}"]
                          },
                          statuses: %{},
+                         files: %{"master" => %{"bors.toml" => delegation_toml()}},
                          pulls: %{
                            1 => pr
                          }
@@ -949,5 +960,249 @@ defmodule BorsNG.CommandTest do
     else
       System.delete_env("COMMAND_TRIGGER")
     end
+  end
+
+  describe "delegation for= duration parsing" do
+    test "delegate+ accepts for= duration" do
+      assert [{:delegate, 86_400}] == Command.parse("bors delegate+ for=24h")
+      assert [{:delegate, 86_400}] == Command.parse("bors d+ for=24h")
+      assert [{:delegate, 604_800}] == Command.parse("bors delegate+ for=7d")
+      assert [{:delegate, 1_209_600}] == Command.parse("bors d+ for=2w")
+    end
+
+    test "delegate+ without for= remains the bare command" do
+      assert [:delegate] == Command.parse("bors delegate+")
+      assert [:delegate] == Command.parse("bors d+")
+    end
+
+    test "delegate= accepts for= duration after username list" do
+      assert [{:delegate_to, "alice", 86_400}] ==
+               Command.parse("bors delegate=alice for=24h")
+
+      assert [
+               {:delegate_to, "alice", 86_400},
+               {:delegate_to, "bob", 86_400}
+             ] == Command.parse("bors d=alice,bob for=24h")
+    end
+
+    test "delegate= without for= preserves the original 2-tuple shape" do
+      assert [{:delegate_to, "alice"}] == Command.parse("bors delegate=alice")
+
+      assert [{:delegate_to, "alice"}, {:delegate_to, "bob"}] ==
+               Command.parse("bors d=alice,bob")
+    end
+
+    test "rejects out-of-range or malformed durations" do
+      # Too long (>90d cap)
+      assert [:delegate] == Command.parse("bors delegate+ for=100d")
+      # Zero
+      assert [:delegate] == Command.parse("bors delegate+ for=0h")
+      # Unrecognized unit
+      assert [:delegate] == Command.parse("bors delegate+ for=24m")
+      # Garbage
+      assert [:delegate] == Command.parse("bors delegate+ for=foo")
+    end
+
+    test "for= token may appear anywhere in the argument list" do
+      # for= in the middle
+      assert [
+               {:delegate_to, "alice", 86_400},
+               {:delegate_to, "bob", 86_400}
+             ] == Command.parse("bors d=alice for=24h bob")
+
+      # for= at the very front
+      assert [
+               {:delegate_to, "alice", 86_400},
+               {:delegate_to, "bob", 86_400}
+             ] == Command.parse("bors d=for=24h alice,bob")
+
+      # Mixed comma/space separators with for= mid-list
+      assert [
+               {:delegate_to, "alice", 86_400},
+               {:delegate_to, "bob", 86_400}
+             ] == Command.parse("bors d=alice,for=24h,bob")
+    end
+
+    test "with multiple for= tokens, the last valid one wins" do
+      assert [{:delegate_to, "alice", 604_800}] ==
+               Command.parse("bors d=alice for=24h for=7d")
+
+      # Last malformed → falls back to earlier valid
+      assert [{:delegate_to, "alice", 86_400}] ==
+               Command.parse("bors d=alice for=24h for=garbage")
+    end
+  end
+
+  test "delegate+ refuses when no for= and no bors.toml default", %{inst: inst} do
+    proj_no_default =
+      %Project{
+        installation_id: inst.id,
+        repo_xref: 15,
+        staging_branch: "staging"
+      }
+      |> Repo.insert!()
+
+    pr = %BorsNG.GitHub.Pr{
+      number: 1,
+      title: "Test",
+      body: "Mess",
+      state: :open,
+      base_ref: "master",
+      head_sha: "00000001",
+      head_ref: "update",
+      base_repo_id: 13,
+      head_repo_id: 13,
+      user: %{id: 2, login: "pr_author"}
+    }
+
+    GitHub.ServerMock.put_state(%{
+      {{:installation, 91}, 15} => %{
+        branches: %{},
+        comments: %{1 => ["bors delegate+"]},
+        statuses: %{},
+        pulls: %{1 => pr}
+      }
+    })
+
+    {:ok, user} =
+      Repo.insert(%BorsNG.Database.User{user_xref: 1, is_admin: true, login: "owner"})
+
+    {:ok, _} =
+      Repo.insert(%BorsNG.Database.Patch{
+        project_id: proj_no_default.id,
+        pr_xref: 1,
+        commit: "N",
+        into_branch: "master"
+      })
+
+    Repo.insert(%BorsNG.Database.LinkUserProject{user_id: user.id, project_id: proj_no_default.id})
+
+    c = %Command{
+      project: proj_no_default,
+      commenter: user,
+      comment: "bors delegate+",
+      pr_xref: 1
+    }
+
+    Command.run(c)
+
+    assert [] == Repo.all(BorsNG.Database.UserPatchDelegation)
+    state = GitHub.ServerMock.get_state()
+    comments = get_in(state, [{{:installation, 91}, 15}, :comments, 1])
+
+    assert Enum.any?(
+             comments,
+             &String.contains?(&1, "Delegation requires an explicit expiration")
+           )
+  end
+
+  test "delegate+ uses bors.toml default when no for= given", %{proj: proj} do
+    pr = %BorsNG.GitHub.Pr{
+      number: 1,
+      title: "Test",
+      body: "Mess",
+      state: :open,
+      base_ref: "master",
+      head_sha: "00000001",
+      head_ref: "update",
+      base_repo_id: 13,
+      head_repo_id: 13,
+      user: %{id: 2, login: "pr_author"}
+    }
+
+    GitHub.ServerMock.put_state(%{
+      {{:installation, 91}, 14} => %{
+        branches: %{},
+        comments: %{1 => ["bors delegate+"]},
+        statuses: %{},
+        files: %{"master" => %{"bors.toml" => delegation_toml()}},
+        pulls: %{1 => pr}
+      }
+    })
+
+    {:ok, user} =
+      Repo.insert(%BorsNG.Database.User{user_xref: 1, is_admin: true, login: "owner"})
+
+    {:ok, _} =
+      Repo.insert(%BorsNG.Database.Patch{
+        project_id: proj.id,
+        pr_xref: 1,
+        commit: "headsha123",
+        into_branch: "master"
+      })
+
+    Repo.insert(%BorsNG.Database.LinkUserProject{user_id: user.id, project_id: proj.id})
+
+    c = %Command{
+      project: proj,
+      commenter: user,
+      comment: "bors delegate+",
+      pr_xref: 1
+    }
+
+    Command.run(c)
+
+    [d] = Repo.all(BorsNG.Database.UserPatchDelegation)
+    refute is_nil(d.expires_at)
+    # Syncer.sync_patch overwrites patch.commit with the PR's head_sha during run.
+    assert d.delegated_at_commit == "00000001"
+  end
+
+  test "re-delegating the same user replaces expires_at", %{proj: proj} do
+    pr = %BorsNG.GitHub.Pr{
+      number: 1,
+      title: "Test",
+      body: "Mess",
+      state: :open,
+      base_ref: "master",
+      head_sha: "00000001",
+      head_ref: "update",
+      base_repo_id: 13,
+      head_repo_id: 13,
+      user: %{id: 2, login: "pr_author"}
+    }
+
+    GitHub.ServerMock.put_state(%{
+      {{:installation, 91}, 14} => %{
+        branches: %{},
+        comments: %{1 => []},
+        statuses: %{},
+        pulls: %{1 => pr}
+      }
+    })
+
+    {:ok, user} =
+      Repo.insert(%BorsNG.Database.User{user_xref: 1, is_admin: true, login: "owner"})
+
+    {:ok, _} =
+      Repo.insert(%BorsNG.Database.Patch{
+        project_id: proj.id,
+        pr_xref: 1,
+        commit: "abc",
+        into_branch: "master"
+      })
+
+    Repo.insert(%BorsNG.Database.LinkUserProject{user_id: user.id, project_id: proj.id})
+
+    Command.run(%Command{
+      project: proj,
+      commenter: user,
+      comment: "bors delegate+ for=1h",
+      pr_xref: 1
+    })
+
+    [d1] = Repo.all(BorsNG.Database.UserPatchDelegation)
+
+    Command.run(%Command{
+      project: proj,
+      commenter: user,
+      comment: "bors delegate+ for=7d",
+      pr_xref: 1
+    })
+
+    [d2] = Repo.all(BorsNG.Database.UserPatchDelegation)
+
+    assert d2.id == d1.id
+    assert NaiveDateTime.compare(d2.expires_at, d1.expires_at) == :gt
   end
 end

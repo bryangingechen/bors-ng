@@ -20,6 +20,7 @@ defmodule BorsNG.Command do
   alias BorsNG.Worker.Attemptor
   alias BorsNG.Worker.Batcher
   alias BorsNG.Command
+  alias BorsNG.Database.Context.Delegation
   alias BorsNG.Database.Context.Logging
   alias BorsNG.Database.Context.Permission
   alias BorsNG.Database.Installation
@@ -125,10 +126,15 @@ defmodule BorsNG.Command do
           | :activate
           | :deactivate
           | :delegate
+          | {:delegate, pos_integer()}
           | {:delegate_to, binary}
+          | {:delegate_to, binary, pos_integer()}
           | {:autocorrect, binary}
           | :ping
           | :retry
+
+  @delegation_max_duration_sec 90 * 24 * 60 * 60
+  def delegation_max_duration_sec, do: @delegation_max_duration_sec
 
   @doc """
   Parse a comment for bors commands.
@@ -173,14 +179,14 @@ defmodule BorsNG.Command do
   def parse_cmd("merge p=" <> rest), do: parse_priority(rest) ++ [:activate]
   def parse_cmd("merge=" <> arguments), do: parse_activation_args(arguments)
   def parse_cmd("merge" <> _), do: [:activate]
-  def parse_cmd("delegate=" <> arguments), do: parse_delegation_args(arguments, :delegate_to)
-  def parse_cmd("delegate+=" <> arguments), do: parse_delegation_args(arguments, :delegate_to)
-  def parse_cmd("delegate+" <> _), do: [:delegate]
+  def parse_cmd("delegate=" <> arguments), do: parse_delegate_with(arguments, :delegate_to)
+  def parse_cmd("delegate+=" <> arguments), do: parse_delegate_with(arguments, :delegate_to)
+  def parse_cmd("delegate+" <> rest), do: parse_delegate_self(rest)
   def parse_cmd("delegate-=" <> arguments), do: parse_delegation_args(arguments, :undelegate_to)
   def parse_cmd("delegate-" <> _), do: [:undelegate]
-  def parse_cmd("d=" <> arguments), do: parse_delegation_args(arguments, :delegate_to)
-  def parse_cmd("d+=" <> arguments), do: parse_delegation_args(arguments, :delegate_to)
-  def parse_cmd("d+" <> _), do: [:delegate]
+  def parse_cmd("d=" <> arguments), do: parse_delegate_with(arguments, :delegate_to)
+  def parse_cmd("d+=" <> arguments), do: parse_delegate_with(arguments, :delegate_to)
+  def parse_cmd("d+" <> rest), do: parse_delegate_self(rest)
   def parse_cmd("d-=" <> arguments), do: parse_delegation_args(arguments, :undelegate_to)
   def parse_cmd("d-" <> _), do: [:undelegate]
   def parse_cmd("+r" <> _), do: [{:autocorrect, "r+"}]
@@ -341,6 +347,92 @@ defmodule BorsNG.Command do
       "" -> []
       nick -> [{action, nick}]
     end)
+  end
+
+  @doc ~S"""
+  Parse a `for=` duration argument like `24h`, `7d`, or `2w`.
+  Returns `{:ok, seconds}` or `:error`. Capped at 90 days.
+
+      iex> alias BorsNG.Command
+      iex> Command.parse_duration("24h")
+      {:ok, 86400}
+      iex> Command.parse_duration("7d")
+      {:ok, 604800}
+      iex> Command.parse_duration("2w")
+      {:ok, 1209600}
+      iex> Command.parse_duration("0h")
+      :error
+      iex> Command.parse_duration("100d")
+      :error
+      iex> Command.parse_duration("abc")
+      :error
+      iex> Command.parse_duration("")
+      :error
+  """
+  @spec parse_duration(binary) :: {:ok, pos_integer()} | :error
+  def parse_duration(str) when is_binary(str) do
+    case Regex.run(~r/^(\d+)(h|d|w)$/, str, capture: :all_but_first) do
+      [n_str, unit] ->
+        n = String.to_integer(n_str)
+
+        secs =
+          case unit do
+            "h" -> n * 60 * 60
+            "d" -> n * 24 * 60 * 60
+            "w" -> n * 7 * 24 * 60 * 60
+          end
+
+        if secs > 0 and secs <= @delegation_max_duration_sec do
+          {:ok, secs}
+        else
+          :error
+        end
+
+      nil ->
+        :error
+    end
+  end
+
+  # Splits a delegate argument list into {names_part, duration_seconds_or_nil}.
+  # A `for=<duration>` token may appear anywhere among the comma/space-separated
+  # tokens; if multiple appear, the last valid one wins. The remaining tokens
+  # are rejoined with ", " for parse_delegation_args/2, which expects comma
+  # separation (a literal space terminates a name).
+  defp extract_delegate_extras(s) do
+    {for_tokens, name_tokens} =
+      s
+      |> String.split(~r/[\s,]+/, trim: true)
+      |> Enum.split_with(&String.starts_with?(&1, "for="))
+
+    duration =
+      for_tokens
+      |> Enum.reverse()
+      |> Enum.find_value(fn token ->
+        case parse_duration(String.replace_prefix(token, "for=", "")) do
+          {:ok, secs} -> secs
+          :error -> nil
+        end
+      end)
+
+    {Enum.join(name_tokens, ", "), duration}
+  end
+
+  defp parse_delegate_with(arguments, action) do
+    {names, duration} = extract_delegate_extras(arguments)
+
+    names
+    |> parse_delegation_args(action)
+    |> Enum.map(fn
+      {^action, login} when not is_nil(duration) -> {action, login, duration}
+      cmd -> cmd
+    end)
+  end
+
+  defp parse_delegate_self(rest) do
+    case extract_delegate_extras(rest) do
+      {_, nil} -> [:delegate]
+      {_, duration} -> [{:delegate, duration}]
+    end
   end
 
   def parse_priority(binary) do
@@ -547,13 +639,22 @@ defmodule BorsNG.Command do
 
   def run(c, :delegate) do
     patch = Repo.preload(c.patch, :author)
-    delegate_to(c, patch.author)
+    delegate_to(c, patch.author, nil)
+  end
+
+  def run(c, {:delegate, duration}) when is_integer(duration) do
+    patch = Repo.preload(c.patch, :author)
+    delegate_to(c, patch.author, duration)
   end
 
   def run(c, {:delegate_to, login}) do
     delegatee = get_or_insert_user_by_login(c, login)
+    delegate_to(c, delegatee, nil)
+  end
 
-    delegate_to(c, delegatee)
+  def run(c, {:delegate_to, login, duration}) when is_integer(duration) do
+    delegatee = get_or_insert_user_by_login(c, login)
+    delegate_to(c, delegatee, duration)
   end
 
   def run(c, :undelegate) do
@@ -632,18 +733,112 @@ defmodule BorsNG.Command do
     end
   end
 
-  def delegate_to(c, delegatee) do
-    # Note that a user can be delegated multiple times
-    # TODO: fix at the database level?
-    Permission.delegate(delegatee, c.patch)
+  def delegate_to(c, delegatee, explicit_duration) do
+    case resolve_delegate_duration(c, explicit_duration) do
+      nil ->
+        c.project.repo_xref
+        |> Project.installation_connection(Repo)
+        |> GitHub.post_comment!(
+          c.pr_xref,
+          ~s{:lock: Delegation requires an explicit expiration. Pass `for=24h`, `for=7d`, or `for=2w`, or set `default_expiry_sec` under `[delegation]` in `bors.toml`.}
+        )
 
-    Project.ping!(c.project.id)
+      duration ->
+        now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+        expires_at = NaiveDateTime.add(now, duration, :second)
 
-    c.project.repo_xref
-    |> Project.installation_connection(Repo)
-    |> GitHub.post_comment!(
-      c.pr_xref,
-      ~s{:v: #{delegatee.login} can now approve this pull request. To approve and merge a pull request, simply reply with `bors r+`. More detailed instructions are available [here](https://bors.tech/documentation/getting-started/#reviewing-pull-requests).}
-    )
+        Permission.delegate(delegatee, c.patch,
+          expires_at: expires_at,
+          delegated_at_commit: c.patch.commit
+        )
+
+        Project.ping!(c.project.id)
+
+        c.project.repo_xref
+        |> Project.installation_connection(Repo)
+        |> GitHub.post_comment!(
+          c.pr_xref,
+          ~s{:v: #{delegatee.login} can now approve this pull request until #{format_expires_at(expires_at)} (in #{format_duration(duration)}). To approve and merge, reply with `bors r+`. More detailed instructions are available [here](https://bors.tech/documentation/getting-started/#reviewing-pull-requests).}
+        )
+    end
   end
+
+  defp resolve_delegate_duration(_c, duration) when is_integer(duration) and duration > 0,
+    do: duration
+
+  defp resolve_delegate_duration(c, nil) do
+    conn = Project.installation_connection(c.project.repo_xref, Repo)
+
+    case Batcher.GetBorsToml.get(conn, c.patch.into_branch) do
+      {:ok, toml} ->
+        Delegation.reconcile_default_expiry(c.patch, toml.delegation_default_expiry_sec)
+        toml.delegation_default_expiry_sec
+
+      {:error, _} ->
+        nil
+    end
+  end
+
+  @minute 60
+  @hour 60 * @minute
+  @day 24 * @hour
+  @week 7 * @day
+
+  @doc """
+  Render a delegation expiry timestamp for a comment, e.g.
+  `"2026-06-07 12:34 UTC"`. Delegations are always stored in UTC, so the
+  zone is spelled out rather than abbreviated to `Z`. Seconds are dropped:
+  they're noise for an expiry deadline.
+
+  ## Examples
+
+      iex> Command.format_expires_at(~N[2026-06-07 12:34:56])
+      "2026-06-07 12:34 UTC"
+  """
+  def format_expires_at(naive_dt) do
+    Calendar.strftime(naive_dt, "%Y-%m-%d %H:%M UTC")
+  end
+
+  @doc """
+  Render `seconds` as a human-friendly duration using up to the two most
+  significant non-zero units, e.g. `"1 week, 5 days"` or `"2 days, 3 hours"`.
+
+  Always **rounds down** (truncates). This is shown as the time left before a
+  delegation expires, so overstating it would be worse than ugly: a user told
+  they have "1 week" when only 6d 23h 59m remains could find they can no
+  longer merge. Rounding down means the displayed figure is a floor — there is
+  always at least this much time left. The cost is the occasional unlovely
+  value like `"6 days, 23 hours"`, which is the right trade here.
+
+  ## Examples
+
+      iex> Command.format_duration(12 * 24 * 60 * 60)
+      "1 week, 5 days"
+      iex> Command.format_duration(51 * 60 * 60)
+      "2 days, 3 hours"
+      iex> Command.format_duration(7 * 24 * 60 * 60)
+      "1 week"
+      iex> Command.format_duration(6 * 86400 + 23 * 3600 + 59 * 60 + 57)
+      "6 days, 23 hours"
+      iex> Command.format_duration(45)
+      "less than a minute"
+  """
+  def format_duration(seconds) when is_integer(seconds) do
+    parts =
+      [{@week, "week"}, {@day, "day"}, {@hour, "hour"}, {@minute, "minute"}]
+      |> Enum.map_reduce(max(seconds, 0), fn {size, label}, remaining ->
+        {{div(remaining, size), label}, rem(remaining, size)}
+      end)
+      |> elem(0)
+      |> Enum.filter(fn {n, _label} -> n > 0 end)
+      |> Enum.take(2)
+
+    case parts do
+      [] -> "less than a minute"
+      parts -> Enum.map_join(parts, ", ", fn {n, label} -> pluralize(n, label) end)
+    end
+  end
+
+  defp pluralize(1, label), do: "1 #{label}"
+  defp pluralize(n, label), do: "#{n} #{label}s"
 end
