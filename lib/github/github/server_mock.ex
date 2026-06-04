@@ -219,18 +219,46 @@ defmodule BorsNG.GitHub.ServerMock do
     {{:error, :get_pr_files, 502, pr_xref}, %{state | :get_pr_files_error => n - 1}}
   end
 
-  def do_handle_call(:get_pr_files, repo_conn, {_pr_xref}, state) do
-    with {:ok, repo} <- Map.fetch(state, repo_conn),
-         {:ok, files} <- Map.fetch(repo, :files),
-         {:ok, z_files} <- Map.fetch(files, "Z") do
-      files =
-        Enum.map(z_files, fn {k, _} ->
-          %BorsNG.GitHub.File{filename: k}
-        end)
+  def do_handle_call(:get_pr_files, repo_conn, {pr_xref}, state) do
+    case get_in(state, [repo_conn, :pr_files, pr_xref]) do
+      # Explicit per-PR file list (a plain list of filenames).
+      filenames when is_list(filenames) ->
+        {{:ok, Enum.map(filenames, &%BorsNG.GitHub.File{filename: &1})}, state}
 
-      {{:ok, files}, state}
+      # Legacy CODEOWNERS shape: :files keyed by the staging commit "Z".
+      _ ->
+        with {:ok, repo} <- Map.fetch(state, repo_conn),
+             {:ok, files} <- Map.fetch(repo, :files),
+             {:ok, z_files} <- Map.fetch(files, "Z") do
+          files =
+            Enum.map(z_files, fn {k, _} ->
+              %BorsNG.GitHub.File{filename: k}
+            end)
+
+          {{:ok, files}, state}
+        else
+          _ -> {{:error, :get_pr_files}, state}
+        end
+    end
+  end
+
+  def do_handle_call(:get_pr_compare, repo_conn, {base, head}, state) do
+    # Tests put a :compare map on the repo keyed by `{base, head}` whose value
+    # is a list of filenames changed between those two refs. Setting
+    # :compare_error makes the call fail, to exercise the :unverifiable paths.
+    repo = Map.get(state, repo_conn, %{})
+
+    if Map.get(repo, :compare_error, false) do
+      {{:error, :get_pr_compare, 502, {base, head}}, state}
     else
-      _ -> {{:error, :get_pr_files}, state}
+      case repo |> Map.get(:compare, %{}) |> Map.fetch({base, head}) do
+        {:ok, filenames} ->
+          files = Enum.map(filenames, &%BorsNG.GitHub.File{filename: &1})
+          {{:ok, files}, state}
+
+        :error ->
+          {{:ok, []}, state}
+      end
     end
   end
 
@@ -627,6 +655,32 @@ defmodule BorsNG.GitHub.ServerMock do
     |> case do
       {:ok, _} = res -> {res, state}
       _ -> {{:error, :get_file}, state}
+    end
+  end
+
+  def do_handle_call(:get_repo_tree, repo_conn, {branch}, state) do
+    with {:ok, repo} <- Map.fetch(state, repo_conn),
+         {:ok, files} <- Map.fetch(repo, :files),
+         branch_files when is_map(branch_files) <- Map.get(files, branch) do
+      # A repo can list branches whose tree is truncated to mirror GitHub's
+      # recursive-tree cap; the real server returns this terminal tuple.
+      if branch in Map.get(repo, :truncated_trees, []) do
+        {{:ok, {:truncated, branch}}, state}
+      else
+        {{:ok, Map.keys(branch_files)}, state}
+      end
+    else
+      _ -> {{:error, :get_repo_tree}, state}
+    end
+  end
+
+  def do_handle_call(:get_pr_comments, repo_conn, {number}, state) do
+    with {:ok, repo} <- Map.fetch(state, repo_conn),
+         {:ok, comments} <- Map.fetch(repo, :comments),
+         {:ok, c} <- Map.fetch(comments, number) do
+      {{:ok, c}, state}
+    else
+      _ -> {{:ok, []}, state}
     end
   end
 

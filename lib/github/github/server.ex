@@ -18,6 +18,11 @@ defmodule BorsNG.GitHub.Server do
   @content_type_raw "application/vnd.github.v3.raw"
   @content_type "application/vnd.github.v3+json"
 
+  # Page size for `pulls/{n}/files`. GitHub caps this endpoint at 100 per page
+  # and 3000 files total; see DELEGATION_INVALIDATION.md, "GitHub API file
+  # ceilings".
+  @pr_files_per_page 100
+
   @type tconn :: GitHub.tconn()
   @type ttoken :: GitHub.ttoken()
   @type trepo :: GitHub.trepo()
@@ -91,18 +96,27 @@ defmodule BorsNG.GitHub.Server do
     {:reply, {:ok, list}, state}
   end
 
-  def do_handle_call(:get_pr_files, repo_conn, {pr_xref}) do
-    case get!(repo_conn, "pulls/#{pr_xref}/files") do
+  def do_handle_call(:get_pr_files, {{:raw, token}, repo_xref}, {pr_xref}) do
+    get_pr_files_(
+      token,
+      "#{site()}/repositories/#{repo_xref}/pulls/#{pr_xref}/files?per_page=#{@pr_files_per_page}",
+      []
+    )
+  end
+
+  def do_handle_call(:get_pr_compare, repo_conn, {base, head}) do
+    case get!(repo_conn, "compare/#{base}...#{head}") do
       %{body: raw, status: 200} ->
-        pr =
+        files =
           raw
           |> Jason.decode!()
+          |> Map.get("files", [])
           |> Enum.map(&GitHub.File.from_json!/1)
 
-        {:ok, pr}
+        {:ok, files}
 
       e ->
-        {:error, :get_pr_files, e.status, pr_xref}
+        {:error, :get_pr_compare, e.status, {base, head}}
     end
   end
 
@@ -430,6 +444,35 @@ defmodule BorsNG.GitHub.Server do
     do_handle_call(:get_reviews, repo_conn, {issue_xref, nil})
   end
 
+  def do_handle_call(:get_repo_tree, repo_conn, {branch}) do
+    with {:branch, %{body: branch_raw, status: 200}} <-
+           {:branch, get!(repo_conn, "branches/#{branch}")},
+         tree_sha <- Jason.decode!(branch_raw)["commit"]["commit"]["tree"]["sha"],
+         {:tree, %{body: tree_raw, status: 200}} <-
+           {:tree, get!(repo_conn, "git/trees/#{tree_sha}?recursive=1")},
+         decoded <- Jason.decode!(tree_raw),
+         # GitHub caps recursive trees (~100k entries / 7MB). A truncated tree
+         # is missing paths, so reporting it as complete would make the lint
+         # emit false "matches no files" warnings. Truncation is deterministic
+         # (a refetch truncates too), so return it as a terminal {:ok, ...} so
+         # call_with_retry stops immediately rather than burning the retry
+         # budget re-fetching a multi-MB tree that can never come back whole.
+         # Callers must skip on :truncated rather than treat it as complete.
+         {:truncated, false} <- {:truncated, decoded["truncated"] == true} do
+      paths =
+        decoded
+        |> Map.get("tree", [])
+        |> Enum.filter(&(&1["type"] == "blob"))
+        |> Enum.map(& &1["path"])
+
+      {:ok, paths}
+    else
+      {:branch, %{status: status, body: body}} -> {:error, :get_repo_tree, status, body}
+      {:tree, %{status: status, body: body}} -> {:error, :get_repo_tree, status, body}
+      {:truncated, true} -> {:ok, {:truncated, branch}}
+    end
+  end
+
   def do_handle_call(:get_file, repo_conn, {branch, path}) do
     resp =
       get!(
@@ -463,6 +506,22 @@ defmodule BorsNG.GitHub.Server do
 
       %{status: status, body: raw} ->
         {:error, :post_comment, status, raw}
+    end
+  end
+
+  def do_handle_call(:get_pr_comments, repo_conn, {number}) do
+    case get!(repo_conn, "issues/#{number}/comments?per_page=100") do
+      %{body: raw, status: 200} ->
+        bodies =
+          raw
+          |> Jason.decode!()
+          |> Enum.map(&Map.get(&1, "body"))
+          |> Enum.reject(&is_nil/1)
+
+        {:ok, bodies}
+
+      e ->
+        {:error, :get_pr_comments, e.status, number}
     end
   end
 
@@ -729,6 +788,37 @@ defmodule BorsNG.GitHub.Server do
     case next_headers do
       [] -> prs
       [next] -> get_open_prs_!(token, next.url, prs)
+    end
+  end
+
+  # Paginate `pulls/{n}/files`. GitHub enforces the 3000-file cap by returning
+  # empty pages past it while the Link header keeps advertising more, so we stop
+  # on the first short page (fewer than per_page) rather than when rel="next"
+  # disappears — otherwise a multi-thousand-file PR fetches dozens of empty
+  # pages. See DELEGATION_INVALIDATION.md, "GitHub API file ceilings".
+  defp get_pr_files_(token, url, acc) do
+    "token #{token}"
+    |> tesla_client(@content_type)
+    |> Tesla.get(url, query: get_url_params(url))
+    |> case do
+      {:ok, %{body: raw, status: 200, headers: headers}} ->
+        files = raw |> Jason.decode!() |> Enum.map(&GitHub.File.from_json!/1)
+        acc = acc ++ files
+
+        if length(files) < @pr_files_per_page do
+          {:ok, acc}
+        else
+          case get_next_headers(headers) do
+            [] -> {:ok, acc}
+            [next] -> get_pr_files_(token, next.url, acc)
+          end
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, :get_pr_files, status, url}
+
+      _ ->
+        {:error, :get_pr_files}
     end
   end
 

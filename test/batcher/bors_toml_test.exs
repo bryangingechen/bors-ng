@@ -142,4 +142,111 @@ defmodule BatcherBorsTomlTest do
     r = BorsToml.new(~s/status = ["exl"]\ndelegation = "nope"/)
     assert r == {:error, :delegation_default_expiry_sec}
   end
+
+  test "defaults delegation_invalidate_on_paths to []" do
+    {:ok, toml} = BorsToml.new(~s/status = ["exl"]/)
+    assert toml.delegation_invalidate_on_paths == []
+  end
+
+  test "parses delegation.invalidate_on_paths" do
+    cfg = ~s"""
+    status = ["exl"]
+    [delegation]
+    invalidate_on_paths = ["Cargo.toml", ".github/**", "src/critical/*.rs"]
+    """
+
+    {:ok, toml} = BorsToml.new(cfg)
+
+    assert toml.delegation_invalidate_on_paths == [
+             "Cargo.toml",
+             ".github/**",
+             "src/critical/*.rs"
+           ]
+  end
+
+  test "rejects non-list delegation.invalidate_on_paths" do
+    r = BorsToml.new(~s/status = ["exl"]\n[delegation]\ninvalidate_on_paths = "Cargo.toml"/)
+    assert r == {:error, :delegation_invalidate_on_paths}
+  end
+
+  test "rejects non-string elements in delegation.invalidate_on_paths" do
+    r = BorsToml.new(~s/status = ["exl"]\n[delegation]\ninvalidate_on_paths = ["ok", 42]/)
+    assert r == {:error, :delegation_invalidate_on_paths}
+  end
+
+  test "defaults delegation_restrict_to_paths to []" do
+    {:ok, toml} = BorsToml.new(~s/status = ["exl"]/)
+    assert toml.delegation_restrict_to_paths == []
+  end
+
+  test "parses delegation.restrict_to_paths" do
+    cfg = ~s"""
+    status = ["exl"]
+    [delegation]
+    restrict_to_paths = ["src/**", "tests/**"]
+    """
+
+    {:ok, toml} = BorsToml.new(cfg)
+
+    assert toml.delegation_restrict_to_paths == ["src/**", "tests/**"]
+  end
+
+  test "parses delegation.restrict_to_paths alongside invalidate_on_paths" do
+    cfg = ~s"""
+    status = ["exl"]
+    [delegation]
+    restrict_to_paths = ["src/**"]
+    invalidate_on_paths = ["src/crypto.rs"]
+    """
+
+    {:ok, toml} = BorsToml.new(cfg)
+
+    assert toml.delegation_restrict_to_paths == ["src/**"]
+    assert toml.delegation_invalidate_on_paths == ["src/crypto.rs"]
+  end
+
+  test "rejects non-list delegation.restrict_to_paths" do
+    r = BorsToml.new(~s/status = ["exl"]\n[delegation]\nrestrict_to_paths = "src"/)
+    assert r == {:error, :delegation_restrict_to_paths}
+  end
+
+  test "rejects non-string elements in delegation.restrict_to_paths" do
+    r = BorsToml.new(~s/status = ["exl"]\n[delegation]\nrestrict_to_paths = ["ok", 42]/)
+    assert r == {:error, :delegation_restrict_to_paths}
+  end
+
+  test "rejects an uncompilable glob in delegation.invalidate_on_paths" do
+    # `:glob.matches/2` raises badarg on a non-terminated character class; reject
+    # it at parse time so the synchronous merge-time gate can't crash on it.
+    r =
+      BorsToml.new(~S"""
+      status = ["exl"]
+      [delegation]
+      invalidate_on_paths = ["src/["]
+      """)
+
+    assert r == {:error, :delegation_invalidate_on_paths}
+  end
+
+  test "rejects an uncompilable glob in delegation.restrict_to_paths" do
+    r =
+      BorsToml.new(~S"""
+      status = ["exl"]
+      [delegation]
+      restrict_to_paths = ["src/["]
+      """)
+
+    assert r == {:error, :delegation_restrict_to_paths}
+  end
+
+  test "accepts valid glob patterns in the delegation path lists" do
+    {:ok, toml} =
+      BorsToml.new(~S"""
+      status = ["exl"]
+      [delegation]
+      restrict_to_paths = ["src/**/*.rs", "a?b"]
+      """)
+
+    assert toml.delegation_restrict_to_paths == ["src/**/*.rs", "a?b"]
+  end
 end

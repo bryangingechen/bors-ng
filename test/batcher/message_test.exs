@@ -20,6 +20,55 @@ defmodule BorsNG.Worker.BatcherMessageTest do
     assert expected_message == actual_message
   end
 
+  test "every bors.toml error key has an explicit, friendly renderer" do
+    # Single source of truth: BorsToml's @type err (introspected below), plus
+    # the fetch-layer-only :fetch_failed. Adding a new validation key extends
+    # that type, which makes this test require an explicit
+    # generate_bors_toml_error/1 clause for it. Forget the clause and the key
+    # falls through to the catch-all, which this test detects and fails on — so
+    # a new key can't silently ship with a generic message (or, before the
+    # catch-all existed, crash the batcher).
+    keys = bors_toml_error_keys() ++ [:fetch_failed]
+
+    # Reconstruct the catch-all's output for a key by templating from a sentinel
+    # that has no explicit clause, so this stays correct if the catch-all
+    # wording changes.
+    sentinel = :__unhandled_sentinel_key__
+
+    catch_all = fn key ->
+      String.replace(
+        Message.generate_bors_toml_error(sentinel),
+        to_string(sentinel),
+        to_string(key)
+      )
+    end
+
+    for key <- keys do
+      message = Message.generate_bors_toml_error(key)
+      assert is_binary(message)
+      assert String.contains?(message, "bors.toml")
+
+      refute message == catch_all.(key),
+             "#{inspect(key)} has no explicit generate_bors_toml_error/1 clause; it falls " <>
+               "through to the catch-all. Add a friendly message in message.ex."
+    end
+  end
+
+  test "unknown bors.toml error keys fall back to the catch-all renderer" do
+    message = Message.generate_bors_toml_error(:some_future_key)
+    assert is_binary(message)
+    assert String.contains?(message, "bors.toml")
+  end
+
+  # Atom members of BorsToml's `@type err` union, read from the compiled
+  # typespec so this list can't drift from the source of truth.
+  defp bors_toml_error_keys do
+    {:ok, types} = Code.Typespec.fetch_types(BorsNG.Worker.Batcher.BorsToml)
+    {_, {:err, definition, []}} = Enum.find(types, fn {_, {name, _, _}} -> name == :err end)
+    {:type, _, :union, members} = definition
+    Enum.map(members, fn {:atom, _, atom} -> atom end)
+  end
+
   test "generate retry message" do
     expected_message = "Build failed (retrying...):\n  * stat"
     example_statuses = [%{url: nil, identifier: "stat"}]

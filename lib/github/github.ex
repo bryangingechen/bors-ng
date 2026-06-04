@@ -39,6 +39,12 @@ defmodule BorsNG.GitHub do
     call_with_retry(:get_pr_files, repo_conn, {pr_xref}, 500, 4_000)
   end
 
+  @spec get_pr_compare(tconn, binary, binary) ::
+          {:ok, [BorsNG.GitHub.File.t()]} | {:error, term}
+  def get_pr_compare(repo_conn, base, head) do
+    call_with_retry(:get_pr_compare, repo_conn, {base, head}, 500, 4_000)
+  end
+
   @spec get_pr!(tconn, integer | bitstring) :: BorsNG.GitHub.Pr.t()
   def get_pr!(repo_conn, pr_xref) do
     {:ok, pr} = get_pr(repo_conn, pr_xref)
@@ -201,6 +207,12 @@ defmodule BorsNG.GitHub do
     call_with_retry(:get_file, repo_conn, {branch, path}, 500, 4_000)
   end
 
+  @spec get_repo_tree(tconn, binary) ::
+          {:ok, [binary]} | {:ok, {:truncated, binary}} | {:error, term}
+  def get_repo_tree(repo_conn, branch) do
+    call_with_retry(:get_repo_tree, repo_conn, {branch}, 500, 4_000)
+  end
+
   @spec force_push!(tconn, binary, binary) :: binary
   def force_push!(repo_conn, sha, to) do
     {:ok, sha} = call_with_retry(:force_push, repo_conn, {sha, to}, 500, 4_000)
@@ -301,6 +313,11 @@ defmodule BorsNG.GitHub do
   def post_comment!(repo_conn, number, body) do
     :ok = call_with_retry(:post_comment, repo_conn, {number, body}, 500, 4_000)
     :ok
+  end
+
+  @spec get_pr_comments(tconn, number) :: {:ok, [binary]} | {:error, term}
+  def get_pr_comments(repo_conn, number) do
+    call_with_retry(:get_pr_comments, repo_conn, {number}, 500, 4_000)
   end
 
   @spec post_commit_status(tconn, {binary, tstatus, binary, binary}) :: :ok | {:error, term}
@@ -508,11 +525,41 @@ defmodule BorsNG.GitHub do
     System.monotonic_time(:millisecond) - started_at >= max_elapsed_ms
   end
 
+  # Total wall-clock budget for the retry loop (not per-attempt; that's
+  # :api_github_timeout). The two values are named "read"/"write" for the
+  # common case, but the real axis is *how costly it is to give up*, which
+  # comes down to two questions:
+  #
+  #   1. Is retrying safe? All reads are idempotent, so they qualify. Some
+  #      writes are too — :post_commit_status, :force_push and :delete_branch
+  #      are all last-write-wins — whereas :merge_branch, :synthesize_commit,
+  #      :create_commit and :post_comment mutate fresh state, so a retry can
+  #      duplicate work (a second comment, a stray commit). Those never get the
+  #      long budget. But idempotency is necessary, not sufficient: it lets a
+  #      write *onto* the list, it doesn't put it there. Question 2 decides that.
+  #   2. What happens if we give up? The long budget is for calls where
+  #      surrendering to a transient GitHub blip has a real cost. This is what
+  #      separates the idempotent writes from each other: :post_commit_status is
+  #      bors reporting its own status — what users and the `ci-success` gate
+  #      watch — so a dropped update leaves a batch looking stuck; worth
+  #      grinding. A failed :force_push / :delete_branch just makes the batcher
+  #      re-run or re-clean the attempt cheaply, so they stay short. :get_pr_compare
+  #      is the sharp read example: on failure classify_delegation/6 returns
+  #      :unverifiable, which the merge-time gate treats as fail-closed and
+  #      *blocks the merge*, forcing a human to re-issue `bors r+`. Grinding for
+  #      three minutes beats that, so it sits on the long budget alongside its
+  #      sibling :get_pr_files.
+  #
+  # Anything not listed (e.g. the advisory-lint reads :get_repo_tree and
+  # :get_pr_comments, whose failure just skips a cosmetic warning) falls through
+  # to the short budget — there's nothing worth tying up a worker three minutes
+  # for. Add an action here only when giving up early would itself be harmful.
   defp max_retry_elapsed_ms(action)
        when action in [
               :get_branch,
               :get_file,
               :get_pr,
+              :get_pr_compare,
               :get_pr_files,
               :get_pr_commits,
               :get_commit_status,

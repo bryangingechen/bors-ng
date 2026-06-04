@@ -29,6 +29,7 @@ defmodule BorsNG.Command do
   alias BorsNG.Database.Project
   alias BorsNG.Database.User
   alias BorsNG.GitHub
+  alias BorsNG.Worker.DelegationInvalidator
   alias BorsNG.Worker.Syncer
 
   import BorsNG.Router.Helpers
@@ -477,13 +478,21 @@ defmodule BorsNG.Command do
 
           :ok
         else
-          required_permission
-          |> Permission.permission?(c.commenter, c.patch)
-          |> if do
-            Enum.each(cmd_list, &run(c, &1))
-            Enum.each(cmd_list, &log(c, &1))
-          else
-            permission_denied(c)
+          cond do
+            # Merge-time gate: a reviewer-level command relying on a delegation
+            # is re-checked against the current head and fails closed. If the
+            # gate denies, it has already revoked + commented (or explained an
+            # unverifiable check), so don't also post the generic denial.
+            required_permission == :reviewer and
+                DelegationInvalidator.verify_for_merge(c.patch, c.commenter) == :deny ->
+              :ok
+
+            Permission.permission?(required_permission, c.commenter, c.patch) ->
+              Enum.each(cmd_list, &run(c, &1))
+              Enum.each(cmd_list, &log(c, &1))
+
+            true ->
+              permission_denied(c)
           end
         end
       end
@@ -609,6 +618,11 @@ defmodule BorsNG.Command do
 
   def run(c, {:try, arguments}) do
     c = fetch_patch(c)
+
+    Task.Supervisor.start_child(BorsNG.Worker.Syncer.Supervisor, fn ->
+      DelegationInvalidator.lint_for_patch(c.patch.id)
+    end)
+
     attemptor = Attemptor.Registry.get(c.project.id)
     Attemptor.tried(attemptor, c.patch.id, arguments)
   end
@@ -734,48 +748,41 @@ defmodule BorsNG.Command do
   end
 
   def delegate_to(c, delegatee, explicit_duration) do
-    case resolve_delegate_duration(c, explicit_duration) do
-      nil ->
-        c.project.repo_xref
-        |> Project.installation_connection(Repo)
-        |> GitHub.post_comment!(
-          c.pr_xref,
-          ~s{:lock: Delegation requires an explicit expiration. Pass `for=24h`, `for=7d`, or `for=2w`, or set `default_expiry_sec` under `[delegation]` in `bors.toml`.}
-        )
+    conn = Project.installation_connection(c.project.repo_xref, Repo)
+    toml = fetch_bors_toml(conn, c)
+    duration = explicit_duration || toml_default_expiry(toml)
 
-      duration ->
-        now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
-        expires_at = NaiveDateTime.add(now, duration, :second)
+    Delegation.reconcile_default_expiry(c.patch, toml_default_expiry(toml))
 
-        Permission.delegate(delegatee, c.patch,
-          expires_at: expires_at,
-          delegated_at_commit: c.patch.commit
-        )
+    if is_integer(duration) and duration > 0 do
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+      expires_at = NaiveDateTime.add(now, duration, :second)
 
-        Project.ping!(c.project.id)
+      Permission.delegate(delegatee, c.patch,
+        expires_at: expires_at,
+        delegated_at_commit: c.patch.commit
+      )
 
-        c.project.repo_xref
-        |> Project.installation_connection(Repo)
-        |> GitHub.post_comment!(
-          c.pr_xref,
-          ~s{:v: #{delegatee.login} can now approve this pull request until #{format_expires_at(expires_at)} (in #{format_duration(duration)}). To approve and merge, reply with `bors r+`. More detailed instructions are available [here](https://bors.tech/documentation/getting-started/#reviewing-pull-requests).}
-        )
+      Project.ping!(c.project.id)
+
+      msg =
+        ~s{:v: #{delegatee.login} can now approve this pull request until #{format_expires_at(expires_at)} (in #{format_duration(duration)}). To approve and merge, reply with `bors r+`. More detailed instructions are available [here](https://bors.tech/documentation/getting-started/#reviewing-pull-requests).} <>
+          delegation_paths_note(toml)
+
+      GitHub.post_comment!(conn, c.pr_xref, msg)
+    else
+      GitHub.post_comment!(
+        conn,
+        c.pr_xref,
+        ~s{:lock: Delegation requires an explicit expiration. Pass `for=24h`, `for=7d`, or `for=2w`, or have a reviewer set `default_expiry_sec` under `[delegation]` in `bors.toml`.}
+      )
     end
   end
 
-  defp resolve_delegate_duration(_c, duration) when is_integer(duration) and duration > 0,
-    do: duration
-
-  defp resolve_delegate_duration(c, nil) do
-    conn = Project.installation_connection(c.project.repo_xref, Repo)
-
+  defp fetch_bors_toml(conn, c) do
     case Batcher.GetBorsToml.get(conn, c.patch.into_branch) do
-      {:ok, toml} ->
-        Delegation.reconcile_default_expiry(c.patch, toml.delegation_default_expiry_sec)
-        toml.delegation_default_expiry_sec
-
-      {:error, _} ->
-        nil
+      {:ok, toml} -> toml
+      {:error, _} -> nil
     end
   end
 
@@ -783,6 +790,46 @@ defmodule BorsNG.Command do
   @hour 60 * @minute
   @day 24 * @hour
   @week 7 * @day
+
+  defp toml_default_expiry(nil), do: nil
+  defp toml_default_expiry(toml), do: toml.delegation_default_expiry_sec
+
+  # Standing note appended to the delegate-success comment, describing what
+  # will revoke the delegation. See DELEGATION_INVALIDATION.md, "User-facing
+  # messages".
+  defp delegation_paths_note(nil), do: ""
+
+  defp delegation_paths_note(toml) do
+    sentences =
+      []
+      |> add_paths_sentence(toml.delegation_restrict_to_paths, fn rendered ->
+        "This delegation only covers changes within #{rendered}; an author commit " <>
+          "touching anything else will revoke it."
+      end)
+      |> add_paths_sentence(toml.delegation_invalidate_on_paths, fn rendered ->
+        "A new author commit touching any of these paths will revoke this delegation: " <>
+          rendered <> "."
+      end)
+
+    case sentences do
+      [] ->
+        ""
+
+      _ ->
+        caveat =
+          "Bors also revokes it if a later push changes too many files for it to check " <>
+            "the full list — even if it stays within scope."
+
+        "\n\n:warning: " <> Enum.join(sentences ++ [caveat], " ")
+    end
+  end
+
+  defp add_paths_sentence(acc, [], _fun), do: acc
+
+  defp add_paths_sentence(acc, paths, fun) do
+    rendered = paths |> Enum.map(&"`#{&1}`") |> Enum.join(", ")
+    acc ++ [fun.(rendered)]
+  end
 
   @doc """
   Render a delegation expiry timestamp for a comment, e.g.
