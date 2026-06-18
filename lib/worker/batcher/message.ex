@@ -399,6 +399,16 @@ defmodule BorsNG.Worker.Batcher.Message do
     "bors.toml: expected [delegation] restrict_to_paths to be a list of glob patterns"
   end
 
+  def generate_bors_toml_error(:labels) do
+    "bors.toml: expected each [labels] entry (on_queue, building, failed, delegated) " <>
+      "to be a non-empty string"
+  end
+
+  def generate_bors_toml_error(:label_names_not_distinct) do
+    "bors.toml: each [labels] entry (on_queue, building, failed, delegated) " <>
+      "must use a distinct label name"
+  end
+
   # Catch-all so a future validation key can never crash the renderer (and the
   # batcher with it) the way the unhandled keys above silently did. Prefer an
   # explicit clause with friendly wording over relying on this.

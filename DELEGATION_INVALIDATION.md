@@ -85,8 +85,23 @@ change. That asymmetry drives the truncation policy below.
 
 ### bors.toml provenance
 
-`bors.toml` is read from the PR's **base** branch, never the head. A PR cannot
-disable invalidation by editing its own copy of the config.
+`bors.toml` is read from the PR's **base** branch (`patch.into_branch`), never
+the head. A PR cannot disable invalidation by editing its own copy of the
+config; a change to the `[delegation]` options only takes effect once it is
+merged into that base branch. This is also self-consistent: the branch the
+config is read from is the same branch a delegated `r+` would merge into, so the
+only person who can weaken a branch's delegation rules is someone who can already
+push to that branch.
+
+Because the rules are per-base-branch they can differ between branches, and a
+PR's base can change mid-flight — bors updates `into_branch` on the
+`pull_request` *edited* webhook (`Syncer.sync_patch`). A live delegation is
+therefore re-evaluated under the **new** base branch's `[delegation]` options
+after a retarget: its `restrict_to_paths` / `invalidate_on_paths` / expiry may
+differ from the branch it was granted under. To avoid surprises, keep the
+`[delegation]` options uniform across the branches bors manages (`LIFECYCLE_LABELS.md`
+notes the same per-branch consideration for the `delegated` label name). See
+[Known limitations](#known-limitations).
 
 ## Deciding what's acceptable
 
@@ -157,6 +172,17 @@ reads vs. writes — see the comment on `max_retry_elapsed_ms/1` for the full
 rationale. The advisory `invalidate_on_paths` lint deliberately stays on the
 short budget: its reads (`get_repo_tree`, `get_pr_comments`) only gate a
 cosmetic warning, so a failure just skips it.
+
+### On close or convert-to-draft (full wipe)
+
+Two lifecycle events drop a PR's delegations outright, independent of the
+path-based checks above: **converting the PR to a draft** and **closing it
+without merging**. Both signal the PR is no longer an active candidate to merge
+under the granted trust, so bors wipes every delegation on the patch (and
+reconciles the `delegated` label off). A PR that bors *merges* is left alone —
+its delegations simply expire and are swept normally. These wipes live in the
+`do_webhook_pr` handler; see `LIFECYCLE_LABELS.md` (the `delegated`
+reconcile-points table) for the full lifecycle.
 
 ## GitHub API file ceilings
 
@@ -325,6 +351,12 @@ issued.
   push that both exceeds 300 changed files *and* touches an out-of-scope
   authored path is un-mergeable by a delegate by design: the truncation hides
   whether that path is new, so bors fails safe.
+- **Per-branch config and retargeting.** `[delegation]` options are read from
+  the PR's current base branch, so retargeting a PR (GitHub's *edit base*) moves
+  it onto that branch's rules — a delegation granted under one branch's
+  `restrict_to_paths` / expiry is re-evaluated under the new branch's on the next
+  push or `r+`. Keeping the options uniform across managed branches avoids the
+  surprise; see [bors.toml provenance](#borstoml-provenance).
 
 See also [bors-ng/rfcs](https://github.com/bors-ng/rfcs) for broader design
 documentation.

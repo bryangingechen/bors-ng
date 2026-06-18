@@ -103,6 +103,7 @@ defmodule BorsNG.GitHub.ServerMock do
           :get_pr_files_error => integer,
           :get_commit_status_error => integer,
           :get_labels_error => integer,
+          :list_issues_by_label_error => boolean,
           :get_reviews_error => integer,
           :post_commit_status_error => integer,
           :post_comment_error => integer
@@ -596,6 +597,58 @@ defmodule BorsNG.GitHub.ServerMock do
     |> case do
       {:ok, _} = res -> {res, state}
       _ -> {{:ok, []}, state}
+    end
+  end
+
+  def do_handle_call(:add_labels, repo_conn, {issue_xref, new_labels}, state) do
+    with {:ok, repo} <- Map.fetch(state, repo_conn) do
+      labels = Map.get(repo, :labels, %{})
+      existing = labels[issue_xref] || []
+      merged = Enum.uniq(existing ++ new_labels)
+      repo = Map.put(repo, :labels, Map.put(labels, issue_xref, merged))
+      {:ok, %{state | repo_conn => repo}}
+    end
+    |> case do
+      {:ok, state} -> {:ok, state}
+      _ -> {{:error, :add_labels}, state}
+    end
+  end
+
+  def do_handle_call(:remove_label, repo_conn, {issue_xref, label}, state) do
+    with {:ok, repo} <- Map.fetch(state, repo_conn) do
+      labels = Map.get(repo, :labels, %{})
+      remaining = (labels[issue_xref] || []) -- [label]
+      repo = Map.put(repo, :labels, Map.put(labels, issue_xref, remaining))
+      {:ok, %{state | repo_conn => repo}}
+    end
+    |> case do
+      {:ok, state} -> {:ok, state}
+      _ -> {{:error, :remove_label}, state}
+    end
+  end
+
+  def do_handle_call(
+        :list_issues_by_label,
+        _repo_conn,
+        {_label},
+        %{list_issues_by_label_error: true} = state
+      ) do
+    {{:error, :list_issues_by_label, 502, "Bad Gateway"}, state}
+  end
+
+  def do_handle_call(:list_issues_by_label, repo_conn, {label}, state) do
+    with {:ok, repo} <- Map.fetch(state, repo_conn) do
+      result =
+        repo
+        |> Map.get(:labels, %{})
+        |> Enum.filter(fn {_issue_xref, names} -> label in (names || []) end)
+        |> Enum.map(fn {issue_xref, names} -> {issue_xref, names} end)
+
+      {{:ok, result}, state}
+    end
+    |> case do
+      {{:ok, _}, _} = res -> res
+      _ -> {{:error, :list_issues_by_label}, state}
     end
   end
 
